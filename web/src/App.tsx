@@ -7,7 +7,7 @@ import './App.css'
 import { ApiError, api } from './api'
 import type { Attempt, Exam, QuestionProgress, Topic, User } from './types'
 
-type Screen = 'loading' | 'auth' | 'dashboard' | 'topics' | 'briefing' | 'exam' | 'results'
+type Screen = 'loading' | 'auth' | 'dashboard' | 'topics' | 'tests' | 'briefing' | 'exam' | 'results'
 type AuthMode = 'sign-in' | 'register'
 
 const attemptStorageKey = 'termforge.activeAttempt'
@@ -183,15 +183,19 @@ function App() {
   }
 
   const handleChooseTopic = async (topic: Topic) => {
-    if (!topic.exam) {
-      setError('There is no published exam for this topic yet.')
+    if (topic.tests.length === 0) {
+      setError('There are no published tests for this topic yet.')
       return
     }
+    setSelectedTopic(topic)
+    setScreen('tests')
+  }
+
+  const handleChooseTest = async (testId: string) => {
     setBusy(true)
     setError('')
     try {
-      const briefing = await api.exam(topic.exam.id)
-      setSelectedTopic(topic)
+      const briefing = await api.exam(testId)
       setExam(briefing)
       setScreen('briefing')
     } catch (briefingError) {
@@ -385,13 +389,21 @@ function App() {
             onBack={() => setScreen('dashboard')}
           />
         )}
+        {screen === 'tests' && selectedTopic && (
+          <TestsScreen
+            topic={selectedTopic}
+            busy={busy}
+            onSelect={handleChooseTest}
+            onBack={() => setScreen('topics')}
+          />
+        )}
         {screen === 'briefing' && exam && selectedTopic && (
           <BriefingScreen
             exam={exam}
             topic={selectedTopic}
             busy={busy}
             onBegin={handleBeginExam}
-            onBack={() => setScreen('topics')}
+            onBack={() => setScreen('tests')}
           />
         )}
         {screen === 'exam' && attempt && (
@@ -591,7 +603,7 @@ function TopicsScreen({
               className="topic-card"
               type="button"
               key={topic.id}
-              disabled={busy || !topic.exam}
+              disabled={busy || topic.tests.length === 0}
               onClick={() => onSelect(topic)}
             >
               <span className={`topic-symbol topic-symbol-${index % 3}`} aria-hidden="true">
@@ -599,20 +611,70 @@ function TopicsScreen({
               </span>
               <span className="topic-card-top">
                 <span className="topic-kicker">TOPIC 0{index + 1}</span>
-                <span className={topic.exam ? 'availability available' : 'availability'}>
-                  <i />{topic.exam ? 'Available' : 'Coming soon'}
+                <span className={topic.tests.length > 0 ? 'availability available' : 'availability'}>
+                  <i />{topic.tests.length > 0 ? 'Available' : 'Coming soon'}
                 </span>
               </span>
               <strong>{topic.name}</strong>
               <span className="topic-description">{topic.description}</span>
               <span className="topic-card-footer">
-                {topic.exam ? `${topic.exam.questions.length} questions · ${topic.exam.totalMarks} marks` : 'No published exam'}
+                {topic.tests.length > 0 ? `${topic.tests.length} tests available` : 'No published tests'}
                 <b aria-hidden="true">↗</b>
               </span>
             </button>
           ))}
         </div>
       )}
+    </section>
+  )
+}
+
+function TestsScreen({
+  topic,
+  busy,
+  onSelect,
+  onBack,
+}: {
+  topic: Topic
+  busy: boolean
+  onSelect: (testId: string) => void
+  onBack: () => void
+}) {
+  return (
+    <section className="content-page">
+      <button className="back-link" type="button" onClick={onBack}>← All topics</button>
+      <div className="page-heading">
+        <span className="eyebrow">{topic.name}</span>
+        <h1>Choose a test.</h1>
+        <p>Each test has 20 terminal questions, 40 marks, and a mix of easy, medium, and high difficulty.</p>
+      </div>
+      {topic.slug === 'docker' && (
+        <div className="alert alert-info" role="note">
+          Docker commands run in a simulator. No real images or containers are created.
+        </div>
+      )}
+      <div className="topic-grid">
+        {topic.tests.map((test) => (
+          <button
+            className="topic-card"
+            type="button"
+            key={test.id}
+            disabled={busy}
+            onClick={() => onSelect(test.id)}
+          >
+            <span className="topic-card-top">
+              <span className="topic-kicker">PRACTICAL TEST</span>
+              <span className="availability available"><i />Available</span>
+            </span>
+            <strong>{test.title}</strong>
+            <span className="topic-description">{test.description}</span>
+            <span className="topic-card-footer">
+              {test.questionCount} questions · {test.totalMarks} marks
+              <b aria-hidden="true">↗</b>
+            </span>
+          </button>
+        ))}
+      </div>
     </section>
   )
 }
@@ -632,7 +694,7 @@ function BriefingScreen({
 }) {
   return (
     <section className="content-page briefing-page">
-      <button className="back-link" type="button" onClick={onBack}>← All topics</button>
+      <button className="back-link" type="button" onClick={onBack}>← All tests</button>
       <div className="briefing-header">
         <span className="topic-label">{topic.name}</span>
         <span className="briefing-rule" />
@@ -661,7 +723,7 @@ function BriefingScreen({
             {exam.questions.map((question, index) => (
               <div className="overview-row" key={question.id}>
                 <span className="overview-number">{String(index + 1).padStart(2, '0')}</span>
-                <div><strong>{question.title}</strong><span>{question.subquestions.length} tasks · {formatTime(question.timeLimitSeconds)}</span></div>
+                <div><strong>{question.title}</strong><span>{question.difficulty} difficulty · {formatTime(question.timeLimitSeconds)}</span></div>
                 <span className="overview-marks">{question.marks} <small>pts</small></span>
               </div>
             ))}
@@ -782,6 +844,7 @@ function ExamScreen({
           <section className="question-card">
             <div className="question-card-meta">
               <span className="eyebrow">PRACTICAL TASK</span>
+              <span className={`difficulty-pill difficulty-${question.difficulty}`}>{question.difficulty} difficulty</span>
               <span className="marks-pill">{question.marks} marks</span>
             </div>
             <h1>{question.title}</h1>

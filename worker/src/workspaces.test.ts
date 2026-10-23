@@ -21,6 +21,7 @@ class FakeDockerRuntime implements DockerRuntime {
   readonly created: CreateContainerInput[] = [];
   readonly running = new Set<string>();
   readonly removed: string[] = [];
+  readonly initialized: string[] = [];
   failStart = false;
 
   async checkAvailability(): Promise<DockerAvailability> {
@@ -39,6 +40,14 @@ class FakeDockerRuntime implements DockerRuntime {
 
   async inspectRunning(containerId: string): Promise<boolean> {
     return this.running.has(containerId);
+  }
+
+  async initializeWorkspace(_containerId: string, template: WorkspaceScope["template"]): Promise<void> {
+    this.initialized.push(template);
+  }
+
+  async inspectState(): Promise<unknown> {
+    return { state: "ready" };
   }
 
   openShell(): never {
@@ -96,6 +105,7 @@ describe("DockerWorkspaceManager", () => {
     assert.equal(runtime.created[0]?.image, "termforge/git-exam:local");
     assert.deepEqual(runtime.created[0]?.limits, limits);
     assert.equal(runtime.created[0]?.labels["com.termforge.workspace-id"], workspace.id);
+    assert.deepEqual(runtime.initialized, ["git-github"]);
   });
 
   it("returns the existing workspace for a retried scope and supports inspect and destroy", async () => {
@@ -180,6 +190,7 @@ describe("DockerWorkspaceManager", () => {
     assert.ok(args.includes("--cap-drop") && args[args.indexOf("--cap-drop") + 1] === "ALL");
     assert.ok(args.includes("--pids-limit") && args[args.indexOf("--pids-limit") + 1] === "64");
     assert.ok(args.includes("--memory") && args[args.indexOf("--memory") + 1] === "256m");
+    assert.ok(args.includes("--tmpfs") && args.some((arg) => arg.startsWith("/run:rw,")));
     assert.ok(args.includes("--user") && args[args.indexOf("--user") + 1] === "1000:1000");
     assert.ok(args.includes("--pull") && args[args.indexOf("--pull") + 1] === "never");
     assert.equal(args.includes("--privileged"), false);
@@ -253,6 +264,28 @@ describe("worker API", () => {
       payload: { ...scope, image: "attacker-controlled-image" },
     });
     assert.equal(arbitraryImage.statusCode, 400);
+  });
+
+  it("returns state only for the matching attempt and question workspace", async () => {
+    const { manager } = makeManager();
+    await manager.create(scope);
+    const app = await createWorkerApp(manager, "worker-test-token");
+    apps.push(app);
+    const headers = { authorization: "Bearer worker-test-token" };
+    const state = await app.inject({
+      method: "POST",
+      url: `/v1/attempts/${scope.attemptId}/questions/${scope.questionId}/state`,
+      headers,
+    });
+    assert.equal(state.statusCode, 200);
+    assert.deepEqual(state.json(), { state: { state: "ready" } });
+
+    const unavailable = await app.inject({
+      method: "POST",
+      url: `/v1/attempts/${scope.attemptId}/questions/git-github-q2/state`,
+      headers,
+    });
+    assert.equal(unavailable.statusCode, 503);
   });
 
   it("rejects a terminal upgrade when the scoped workspace shell cannot be opened", async () => {

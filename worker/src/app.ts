@@ -117,6 +117,20 @@ export async function createWorkerApp(manager: WorkspaceManager, workerToken: st
     return reply.code(201).send(workspace);
   });
 
+  app.post<{ Params: { attemptId: string; questionId: string } }>(
+    "/v1/attempts/:attemptId/questions/:questionId/state",
+    async (request) => {
+      const { attemptId, questionId } = request.params;
+      if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(attemptId)) {
+        throw new InvalidWorkspaceRequestError("attemptId must be a UUID.");
+      }
+      if (!/^[a-z0-9-]+-q[1-9][0-9]*$/.test(questionId)) {
+        throw new InvalidWorkspaceRequestError("questionId is invalid.");
+      }
+      return { state: await manager.inspectState(attemptId, questionId) };
+    },
+  );
+
   app.get<{ Params: { workspaceId: string } }>("/v1/workspaces/:workspaceId", async (request, reply) => {
     const workspaceId = parseWorkspaceId(request.params.workspaceId);
     const workspace = await manager.inspect(workspaceId);

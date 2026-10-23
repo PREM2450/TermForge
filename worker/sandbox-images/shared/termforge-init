@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+WORKSPACE = Path("/workspace")
+sys.path.insert(0, "/opt/termforge")
+
+
+def run(*args: str) -> None:
+    subprocess.run(args, cwd=WORKSPACE, check=True, capture_output=True, text=True)
+
+
+template = sys.argv[1]
+if template == "docker-server":
+    with open(os.devnull, "wb") as null:
+        subprocess.Popen(
+            ["python3", "/opt/termforge/docker_state.py"],
+            stdin=null,
+            stdout=null,
+            stderr=null,
+            start_new_session=True,
+        )
+    for _ in range(40):
+        if Path("/run/termforge/docker.sock").exists():
+            break
+        time.sleep(0.05)
+    else:
+        raise RuntimeError("Docker simulator state service did not start")
+elif template == "git-github":
+    run("git", "init", "--initial-branch=master")
+    run("git", "config", "user.name", "TermForge Candidate")
+    run("git", "config", "user.email", "candidate@termforge.test")
+    (WORKSPACE / "README.md").write_text("# Release workspace\n")
+    run("git", "add", "README.md")
+    run("git", "commit", "-m", "Initialize workspace")
+    for number in range(1, 16):
+        run("git", "branch", f"obsolete-{number}")
+elif template == "docker":
+    (WORKSPACE / "Dockerfile").write_text("FROM scratch\n")
+    (WORKSPACE / "config.json").write_text('{"service":"termforge"}\n')
+    (WORKSPACE / "site").mkdir(exist_ok=True)
+elif template == "data-migration":
+    pass

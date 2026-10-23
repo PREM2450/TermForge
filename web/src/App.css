@@ -1129,6 +1129,30 @@
   font-weight: 650;
 }
 
+.difficulty-pill {
+  margin-left: auto;
+  padding: 5px 8px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 650;
+  text-transform: capitalize;
+}
+
+.difficulty-easy {
+  background: #eef7f0;
+  color: #35734a;
+}
+
+.difficulty-medium {
+  background: #fff5df;
+  color: #8c6217;
+}
+
+.difficulty-high {
+  background: #fff0ed;
+  color: #a14332;
+}
+
 .question-card h1 {
   margin: 15px 0 8px;
   color: var(--ink);

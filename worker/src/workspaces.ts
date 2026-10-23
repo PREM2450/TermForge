@@ -38,6 +38,7 @@ export class WorkspaceUnavailableError extends Error {
 export interface WorkspaceManager {
   create(scope: WorkspaceScope): Promise<Workspace>;
   inspect(workspaceId: string): Promise<Workspace | null>;
+  inspectState(attemptId: string, questionId: string): Promise<unknown>;
   openShell(workspaceId: string): Promise<ChildProcessWithoutNullStreams>;
   destroy(workspaceId: string): Promise<boolean>;
   availability(): Promise<DockerAvailability>;
@@ -159,6 +160,9 @@ export class DockerWorkspaceManager implements WorkspaceManager {
       if (!(await this.runtime.inspectRunning(containerId))) {
         throw new WorkspaceUnavailableError("Docker did not start the workspace container.");
       }
+      if (scope.template !== "data-migration") {
+        await this.runtime.initializeWorkspace(containerId, scope.template);
+      }
       if (this.disposed) {
         throw new WorkspaceUnavailableError("Worker is shutting down.");
       }
@@ -191,6 +195,15 @@ export class DockerWorkspaceManager implements WorkspaceManager {
       return null;
     }
     return { ...record.workspace };
+  }
+
+  async inspectState(attemptId: string, questionId: string): Promise<unknown> {
+    const workspaceId = this.idsByScope.get(`${attemptId}:${questionId}`);
+    const record = workspaceId ? this.recordsById.get(workspaceId) : undefined;
+    if (!record) throw new WorkspaceUnavailableError("The question workspace is unavailable.");
+    const workspace = await this.inspect(record.workspace.id);
+    if (!workspace) throw new WorkspaceUnavailableError("The question workspace is unavailable.");
+    return this.runtime.inspectState(record.containerId, workspace.template);
   }
 
   async openShell(workspaceId: string): Promise<ChildProcessWithoutNullStreams> {

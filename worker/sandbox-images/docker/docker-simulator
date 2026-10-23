@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import sys
+
+sys.path.insert(0, "/opt/termforge")
+from docker_state import request
+
+try:
+    response = request(sys.argv[1:])
+except Exception as error:
+    print(f"docker: simulator unavailable: {error}", file=sys.stderr)
+    raise SystemExit(1)
+print(response.get("output", ""), end="")
+raise SystemExit(int(response.get("exitCode", 1)))

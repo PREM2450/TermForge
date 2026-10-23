@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1792755253783,
+      "tag": "0000_concerned_raza",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1792756352114,
+      "tag": "0001_clever_hiroim",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1792756994388,
+      "tag": "0002_durable_exam_catalog",
+      "breakpoints": true
+    }
+  ]
+}

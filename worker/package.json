@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "tsx --test src/workspaces.test.ts",
+    "test:simulator": "python3 -m unittest sandbox-images/docker/test_docker_state.py",
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js"

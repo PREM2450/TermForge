@@ -31,6 +31,7 @@ export const users = pgTable(
   {
     id: uuid("id").defaultRandom().primaryKey(),
     email: varchar("email", { length: 254 }).notNull(),
+    name: varchar("name", { length: 100 }).notNull().default(""),
     passwordHash: varchar("password_hash", { length: 255 }).notNull(),
     role: userRole("role").notNull().default("candidate"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -64,13 +65,14 @@ export const topics = pgTable(
 
 export const exams = pgTable("exams", {
   id: uuid("id").defaultRandom().primaryKey(),
+  slug: varchar("slug", { length: 200 }).notNull(),
   topicId: uuid("topic_id").notNull().references(() => topics.id, { onDelete: "cascade" }),
   title: varchar("title", { length: 200 }).notNull(),
   totalMarks: integer("total_marks").notNull(),
   durationSeconds: integer("duration_seconds").notNull(),
   published: boolean("published").notNull().default(false),
   allowPrevious: boolean("allow_previous").notNull().default(false),
-});
+}, (table) => [uniqueIndex("exams_slug_uq").on(table.slug)]);
 
 export const questions = pgTable(
   "questions",

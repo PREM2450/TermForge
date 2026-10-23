@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+WORKSPACE = Path("/workspace")
+
+
+def git_output(*args: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(WORKSPACE), *args],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def git_state() -> dict:
+    branch = git_output("branch", "--show-current")
+    branches = git_output("branch", "--format=%(refname:short)") or ""
+    tags = git_output("tag", "--list") or ""
+    remotes = git_output("remote")
+    remote_names = remotes.splitlines() if remotes else []
+    remote_urls = {
+        name: git_output("remote", "get-url", name)
+        for name in remote_names
+    }
+    remote_urls["originPush"] = git_output("config", "--get", "remote.origin.pushurl")
+    latest = git_output("rev-list", "--parents", "-n", "1", "HEAD") or ""
+    commit_count = git_output("rev-list", "--count", "HEAD")
+    staged = git_output("diff", "--cached", "--name-only", "--")
+    ignored: dict[str, bool] = {}
+    for number in range(1, 16):
+        candidate = f"report-{number}.release-{number}.tmp"
+        ignored[f"ignoredRelease{number}"] = (
+            git_output("check-ignore", "--no-index", candidate) is not None
+        )
+    config = {
+        "userName": git_output("config", "--local", "--get", "user.name"),
+        "userEmail": git_output("config", "--local", "--get", "user.email"),
+        "core": {
+            "editor": git_output("config", "--local", "--get", "core.editor"),
+        },
+    }
+    output = {
+        "branch": branch,
+        "currentBranch": branch,
+        "branches": {name: True for name in branches.splitlines()},
+        "config": config,
+        "stagedFiles": staged.splitlines() if staged else [],
+        "latestCommit": {
+            "message": git_output("log", "-1", "--format=%s"),
+            "parentCount": max(0, len(latest.split()) - 1),
+        },
+        "commitCount": int(commit_count) if commit_count else 0,
+        "tags": {name: True for name in tags.splitlines()},
+        "remotes": remote_urls,
+        "upstream": git_output(
+            "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
+        ),
+        "stashCount": len((git_output("stash", "list", "--format=%H") or "").splitlines()),
+        "workingTreeClean": git_output("status", "--porcelain", "--untracked-files=all") == "",
+        **ignored,
+    }
+    for number in range(1, 16):
+        output["branches"].setdefault(f"obsolete-{number}", False)
+        output[f"stagedRelease{number}"] = f"release-{number}.md" in output["stagedFiles"]
+        output[f"releaseTag{number}"] = (
+            git_output("cat-file", "-t", f"refs/tags/v1.0.{number}") == "tag"
+        )
+        output[f"cleanRelease{number}"] = (
+            output["workingTreeClean"]
+            and output["latestCommit"]["message"] == f"Clean release {number}"
+            and git_output("cat-file", "-e", f"HEAD:clean-{number}.txt") is not None
+        )
+    return output
+
+
+def docker_state() -> dict:
+    sys.path.insert(0, "/opt/termforge")
+    from docker_state import request
+
+    response = request(["__inspect__"])
+    state = response.get("state")
+    if response.get("exitCode") != 0 or not isinstance(state, dict):
+        raise RuntimeError("Docker simulator returned invalid state")
+    fields = state.get("fields")
+    if not isinstance(fields, dict):
+        raise RuntimeError("Docker simulator returned invalid grading fields")
+    return fields
+
+
+template = sys.argv[1]
+if template == "git-github":
+    state = {"git": git_state()}
+elif template == "docker":
+    state = {"docker": docker_state()}
+else:
+    raise ValueError("No grading inspector is configured for this template")
+print(json.dumps(state, separators=(",", ":")))

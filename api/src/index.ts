@@ -1,4 +1,20 @@
 import { randomUUID } from "node:crypto";
+import "dotenv/config";
+import { createDatabase } from "./db/client.js";
+import {
+  createExamAttempt,
+  createUserSession,
+  findActiveAttemptId,
+  findSessionUser,
+  findUserByEmail,
+  loadExamAttempt,
+  registerUserWithSession,
+  revokeUserSession,
+  saveExamAttempt,
+  syncExamCatalog,
+  type StoredExamAttempt,
+  type StoredQuestionProgress,
+} from "./db/persistence.js";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
 import jwt from "@fastify/jwt";
@@ -14,7 +30,6 @@ import {
   type WorkspaceTemplate,
 } from "./executor/types.js";
 
-type AttemptStatus = "in_progress" | "submitted" | "expired";
 type QuestionStatus = "locked" | "active" | "submitted" | "expired" | "skipped";
 
 interface Candidate {
@@ -22,32 +37,11 @@ interface Candidate {
   name: string;
   email: string;
   passwordHash: string;
-  role: "candidate";
-  sessions: Set<string>;
+  role: "candidate" | "admin";
 }
 
-interface QuestionAttempt {
-  questionId: string;
-  status: QuestionStatus;
-  startedAt: Date | null;
-  deadlineAt: Date | null;
-  submittedAt: Date | null;
-  score: number;
-  feedback?: string[];
-}
-
-interface ExamAttempt {
-  id: string;
-  userId: string;
-  exam: ExamDefinition;
-  status: AttemptStatus;
-  startedAt: Date;
-  deadlineAt: Date;
-  submittedAt: Date | null;
-  currentQuestionId: string | null;
-  questions: QuestionAttempt[];
-  totalScore: number;
-}
+type QuestionAttempt = StoredQuestionProgress;
+type ExamAttempt = StoredExamAttempt;
 
 interface SessionClaims {
   sub: string;
@@ -58,7 +52,7 @@ interface PublicUser {
   id: string;
   name: string;
   email: string;
-  role: "candidate";
+  role: "candidate" | "admin";
 }
 
 interface TerminalTicket {
@@ -80,6 +74,12 @@ class HttpError extends Error {
   }
 }
 
+function isUniqueViolation(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  if ("code" in error && (error as { code?: unknown }).code === "23505") return true;
+  return "cause" in error && isUniqueViolation(error.cause);
+}
+
 declare module "fastify" {
   interface FastifyRequest {
     candidate: PublicUser | null;
@@ -93,7 +93,13 @@ const cookieSecure = process.env.COOKIE_SECURE === "true" || isProduction;
 const jwtSecret =
   process.env.JWT_SECRET ?? "termforge-local-development-secret-change-before-deploy";
 const cookieName = "termforge_session";
+const databaseUrl = process.env.DATABASE_URL;
 
+if (!databaseUrl) {
+  throw new Error("DATABASE_URL must be configured");
+}
+
+const { db, pool } = createDatabase(databaseUrl);
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("PORT must be a valid TCP port");
 }
@@ -104,9 +110,6 @@ if (jwtSecret.length < 32) {
   throw new Error("JWT_SECRET must contain at least 32 characters");
 }
 
-const candidatesByEmail = new Map<string, Candidate>();
-const candidatesById = new Map<string, Candidate>();
-const attemptsById = new Map<string, ExamAttempt>();
 const terminalTickets = new Map<string, TerminalTicket>();
 const executor = createExecutor();
 const app = Fastify({
@@ -137,14 +140,17 @@ app.setErrorHandler((error, request, reply) => {
       message: error.issues[0]?.message ?? "Request validation failed",
     });
   }
-  request.log.error({ err: error }, "Request failed");
+  request.log.error(
+    { errorName: error instanceof Error ? error.name : "UnknownError" },
+    "Request failed",
+  );
   return reply.code(500).send({
     error: "INTERNAL_ERROR",
     message: "The server could not complete the request.",
   });
 });
 
-function publicUser(candidate: Candidate): PublicUser {
+function publicUser(candidate: Pick<Candidate, "id" | "name" | "email" | "role">): PublicUser {
   return {
     id: candidate.id,
     name: candidate.name,
@@ -160,8 +166,8 @@ const authenticate = async (request: FastifyRequest): Promise<void> => {
   } catch {
     throw new HttpError(401, "Sign in to continue.", "UNAUTHENTICATED");
   }
-  const candidate = candidatesById.get(claims.sub);
-  if (!candidate || !candidate.sessions.has(claims.sid)) {
+  const candidate = await findSessionUser(db, claims.sid);
+  if (!candidate || candidate.id !== claims.sub) {
     throw new HttpError(401, "Your session has expired. Sign in again.", "UNAUTHENTICATED");
   }
   request.candidate = publicUser(candidate);
@@ -184,11 +190,13 @@ function questionId(exam: ExamDefinition, index: number): string {
   return `${exam.slug}-q${index + 1}`;
 }
 
-function findAttempt(userId: string, attemptId: string): ExamAttempt {
-  const attempt = attemptsById.get(attemptId);
-  if (!attempt || attempt.userId !== userId) {
+async function findAttempt(userId: string, attemptId: string): Promise<ExamAttempt> {
+  const attempt = await loadExamAttempt(db, userId, attemptId, examCatalog);
+  if (!attempt) {
     throw new HttpError(404, "Attempt not found.", "NOT_FOUND");
   }
+  refreshAttempt(attempt);
+  await saveExamAttempt(db, attempt);
   return attempt;
 }
 
@@ -243,7 +251,6 @@ function refreshAttempt(attempt: ExamAttempt): void {
 }
 
 function toAttemptDto(attempt: ExamAttempt) {
-  refreshAttempt(attempt);
   return {
     id: attempt.id,
     examId: attempt.exam.slug,
@@ -261,6 +268,7 @@ function toAttemptDto(attempt: ExamAttempt) {
         prompt: string;
         timeLimitSeconds: number;
         marks: number;
+        difficulty: QuestionDefinition["difficulty"];
         subquestions: Array<{ id: string; prompt: string; marks: number }>;
         status: QuestionStatus;
         startedAt: string | null;
@@ -273,6 +281,7 @@ function toAttemptDto(attempt: ExamAttempt) {
         prompt: question.prompt,
         timeLimitSeconds: question.timeLimitSeconds,
         marks: question.marks,
+        difficulty: question.difficulty,
         subquestions: question.subquestions.map((subquestion, subIndex) => ({
           id: `${progress.questionId}-s${subIndex + 1}`,
           prompt: subquestion.prompt,
@@ -308,9 +317,9 @@ function getActiveQuestion(attempt: ExamAttempt, id: string): {
   return result;
 }
 
-function getWorkspaceTemplate(slug: string): WorkspaceTemplate {
-  if (slug === "git-github" || slug === "docker" || slug === "data-migration") {
-    return slug;
+function getWorkspaceTemplate(topicSlug: ExamDefinition["topicSlug"]): WorkspaceTemplate {
+  if (topicSlug === "git-github" || topicSlug === "docker" || topicSlug === "data-migration") {
+    return topicSlug;
   }
   throw new HttpError(503, "No isolated terminal is configured for this exam.", "EXECUTOR_UNAVAILABLE");
 }
@@ -328,41 +337,49 @@ function websocketBuffer(data: RawData): Buffer {
   return Buffer.from(data);
 }
 
-function topicDto(exam: ExamDefinition) {
+function topicDto(topicSlug: ExamDefinition["topicSlug"]) {
+  const exams = examCatalog.filter((item) => item.topicSlug === topicSlug);
+  const topicTitle = exams[0]?.topicTitle;
+  if (!topicTitle) throw new Error(`No published exam exists for ${topicSlug}`);
+  const description =
+    topicSlug === "git-github"
+      ? "Git fundamentals, branching, commits, remotes, and collaboration."
+      : topicSlug === "docker"
+        ? "Docker CLI workflows practiced safely in an in-memory simulator."
+        : "Plan and verify safe schema and data transformations.";
   return {
-    id: exam.slug,
-    slug: exam.slug,
-    name: exam.title,
-    description: exam.description,
-    exam: {
+    id: topicSlug,
+    slug: topicSlug,
+    name: topicTitle,
+    description,
+    tests: exams.map((exam) => ({
       id: exam.slug,
-      title: exam.examTitle,
-      overallDurationSeconds: exam.durationSeconds,
+      title: exam.title,
+      description: exam.description,
       totalMarks: exam.totalMarks,
-      questions: exam.questions.map((question, index) => ({
-        id: questionId(exam, index),
-        title: question.title,
-        prompt: question.prompt,
-        timeLimitSeconds: question.timeLimitSeconds,
-        marks: question.marks,
-        subquestions: question.subquestions.map((subquestion, subIndex) => ({
-          id: `${questionId(exam, index)}-s${subIndex + 1}`,
-          prompt: subquestion.prompt,
-          marks: subquestion.marks,
-        })),
-      })),
-    },
+      questionCount: exam.questions.length,
+    })),
   };
 }
 
-app.get("/health", async () => ({
-  status: "ok",
-  mode: "local-memory",
-  terminalExecution:
-    process.env.SANDBOX_WORKER_URL && process.env.SANDBOX_WORKER_TOKEN
-      ? "configured"
-      : "unavailable",
-}));
+app.get("/health", async (_request, reply) => {
+  let database = "unavailable";
+  try {
+    await pool.query("SELECT 1");
+    database = "connected";
+  } catch {
+    reply.code(503);
+  }
+  return {
+    status: database === "connected" ? "ok" : "unavailable",
+    mode: "postgres",
+    database,
+    terminalExecution:
+      process.env.SANDBOX_WORKER_URL && process.env.SANDBOX_WORKER_TOKEN
+        ? "configured"
+        : "unavailable",
+  };
+});
 
 app.get("/api/me", { preHandler: authenticate }, async (request) => ({
   ...requireCandidate(request),
@@ -381,8 +398,13 @@ const loginSchema = z.object({
 
 async function setSession(candidate: Candidate, reply: FastifyReply): Promise<PublicUser> {
   const sessionId = randomUUID();
-  candidate.sessions.add(sessionId);
   const token = await reply.jwtSign({ sub: candidate.id, sid: sessionId });
+  await createUserSession(db, candidate.id, sessionId, new Date(Date.now() + 12 * 60 * 60 * 1000));
+  applySessionCookie(reply, token);
+  return publicUser(candidate);
+}
+
+function applySessionCookie(reply: FastifyReply, token: string): void {
   reply.setCookie(cookieName, token, {
     path: "/",
     httpOnly: true,
@@ -390,31 +412,43 @@ async function setSession(candidate: Candidate, reply: FastifyReply): Promise<Pu
     sameSite: "lax",
     maxAge: 60 * 60 * 12,
   });
-  return publicUser(candidate);
 }
 
 app.post("/api/auth/register", async (request, reply) => {
   const body = registrationSchema.parse(request.body);
   const email = body.email.toLowerCase();
-  if (candidatesByEmail.has(email)) {
-    throw new HttpError(409, "An account with this email already exists.", "EMAIL_IN_USE");
+  const passwordHash = await argon2.hash(body.password);
+  const userId = randomUUID();
+  const sessionId = randomUUID();
+  const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
+  const token = await reply.jwtSign({ sub: userId, sid: sessionId });
+  let candidate: Candidate;
+  try {
+    candidate = await registerUserWithSession(
+      db,
+      {
+        name: body.name,
+        email,
+        passwordHash,
+        role: "candidate",
+      },
+      userId,
+      sessionId,
+      expiresAt,
+    );
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      throw new HttpError(409, "An account with this email already exists.", "EMAIL_IN_USE");
+    }
+    throw error;
   }
-  const candidate: Candidate = {
-    id: randomUUID(),
-    name: body.name,
-    email,
-    passwordHash: await argon2.hash(body.password),
-    role: "candidate",
-    sessions: new Set(),
-  };
-  candidatesByEmail.set(email, candidate);
-  candidatesById.set(candidate.id, candidate);
-  return reply.code(201).send({ user: await setSession(candidate, reply) });
+  applySessionCookie(reply, token);
+  return reply.code(201).send({ user: publicUser(candidate) });
 });
 
 app.post("/api/auth/login", async (request, reply) => {
   const body = loginSchema.parse(request.body);
-  const candidate = candidatesByEmail.get(body.email.toLowerCase());
+  const candidate = await findUserByEmail(db, body.email.toLowerCase());
   if (!candidate || !(await argon2.verify(candidate.passwordHash, body.password))) {
     throw new HttpError(401, "Email or password is incorrect.", "INVALID_CREDENTIALS");
   }
@@ -424,18 +458,21 @@ app.post("/api/auth/login", async (request, reply) => {
 app.post("/api/auth/logout", { preHandler: authenticate }, async (request, reply) => {
   const token = request.cookies[cookieName];
   if (token) {
+    let claims: SessionClaims | undefined;
     try {
-      const claims = app.jwt.verify<SessionClaims>(token);
-      candidatesById.get(claims.sub)?.sessions.delete(claims.sid);
+      claims = app.jwt.verify<SessionClaims>(token);
     } catch {
       request.log.info("Ignoring invalid session token during logout");
+    }
+    if (claims?.sub === requireCandidate(request).id) {
+      await revokeUserSession(db, claims.sid);
     }
   }
   return reply.clearCookie(cookieName, { path: "/" }).code(204).send();
 });
 
 app.get("/api/topics", { preHandler: authenticate }, async () =>
-  examCatalog.map(topicDto),
+  [...new Set(examCatalog.map((exam) => exam.topicSlug))].map(topicDto),
 );
 
 app.get<{ Params: { examId: string } }>(
@@ -446,12 +483,24 @@ app.get<{ Params: { examId: string } }>(
     return {
       id: exam.slug,
       title: exam.examTitle,
-      topicId: exam.slug,
+      topicId: exam.topicSlug,
       overallDurationSeconds: exam.durationSeconds,
       totalMarks: exam.totalMarks,
       navigationPolicy: "forward-only",
       reviewPolicy: "score",
-      questions: topicDto(exam).exam.questions,
+      questions: exam.questions.map((question, index) => ({
+        id: questionId(exam, index),
+        title: question.title,
+        prompt: question.prompt,
+        timeLimitSeconds: question.timeLimitSeconds,
+        marks: question.marks,
+        difficulty: question.difficulty,
+        subquestions: question.subquestions.map((subquestion, subIndex) => ({
+          id: `${questionId(exam, index)}-s${subIndex + 1}`,
+          prompt: subquestion.prompt,
+          marks: subquestion.marks,
+        })),
+      })),
     };
   },
 );
@@ -462,76 +511,65 @@ app.post<{ Params: { examId: string } }>(
   async (request, reply) => {
     const candidate = requireCandidate(request);
     const exam = findExam(request.params.examId);
-    const existing = [...attemptsById.values()].find(
-      (attempt) => attempt.userId === candidate.id && attempt.exam.slug === exam.slug && attempt.status === "in_progress",
-    );
-    if (existing) return toAttemptDto(existing);
+    const existingId = await findActiveAttemptId(db, candidate.id, exam.slug);
+    if (existingId) {
+      const existing = await findAttempt(candidate.id, existingId);
+      if (existing.status === "in_progress") return toAttemptDto(existing);
+    }
 
-    const now = new Date();
-    const attemptId = randomUUID();
-    const deadlineAt = new Date(now.getTime() + exam.durationSeconds * 1000);
-    const questions: QuestionAttempt[] = exam.questions.map((_, index) => ({
-      questionId: questionId(exam, index),
-      status: index === 0 ? "active" : "locked",
-      startedAt: index === 0 ? now : null,
-      deadlineAt:
-        index === 0
-          ? new Date(Math.min(deadlineAt.getTime(), now.getTime() + exam.questions[0]!.timeLimitSeconds * 1000))
-          : null,
-      submittedAt: null,
-      score: 0,
-    }));
-    const attempt: ExamAttempt = {
-      id: attemptId,
-      userId: candidate.id,
-      exam,
-      status: "in_progress",
-      startedAt: now,
-      deadlineAt,
-      submittedAt: null,
-      currentQuestionId: questionId(exam, 0),
-      questions,
-      totalScore: 0,
-    };
-    attemptsById.set(attempt.id, attempt);
-    return reply.code(201).send(toAttemptDto(attempt));
+    try {
+      const attemptId = await createExamAttempt(db, candidate.id, exam, new Date());
+      const attempt = await loadExamAttempt(db, candidate.id, attemptId, examCatalog);
+      if (!attempt) throw new Error("The created exam attempt could not be loaded");
+      return reply.code(201).send(toAttemptDto(attempt));
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        const concurrentId = await findActiveAttemptId(db, candidate.id, exam.slug);
+        if (concurrentId) {
+          const concurrent = await findAttempt(candidate.id, concurrentId);
+          return toAttemptDto(concurrent);
+        }
+      }
+      throw error;
+    }
   },
 );
 
 app.get<{ Params: { attemptId: string } }>(
   "/api/attempts/:attemptId",
   { preHandler: authenticate },
-  async (request) => toAttemptDto(findAttempt(requireCandidate(request).id, request.params.attemptId)),
+  async (request) =>
+    toAttemptDto(await findAttempt(requireCandidate(request).id, request.params.attemptId)),
 );
 
 app.post<{ Params: { attemptId: string; questionId: string } }>(
   "/api/attempts/:attemptId/questions/:questionId/check",
   { preHandler: authenticate },
   async (request) => {
-    const attempt = findAttempt(requireCandidate(request).id, request.params.attemptId);
+    const attempt = await findAttempt(requireCandidate(request).id, request.params.attemptId);
     const { question, progress } = getActiveQuestion(attempt, request.params.questionId);
+    let result: ReturnType<typeof gradeQuestion>;
     try {
       const state = await executor.inspect({
         attemptId: attempt.id,
         questionId: progress.questionId,
       });
-      const result = gradeQuestion(state, question);
-      progress.score = result.score;
-      if (attempt.exam.slug) {
-        progress.feedback = result.checks.map(
-          (check, index) =>
-            `${question.subquestions[index]?.label ?? index + 1}: ${check.earned}/${check.maximum} marks`,
-        );
-      }
-      recomputeScore(attempt);
-      return { score: result.score, maximum: result.maximum };
+      result = gradeQuestion(state, question);
     } catch (error) {
       if (error instanceof ExecutorUnavailableError) {
         throw new HttpError(503, "Isolated terminal execution is not configured.", error.code);
       }
-      request.log.error({ err: error }, "Could not inspect isolated exam environment");
+      request.log.error("Could not inspect isolated exam environment");
       throw new HttpError(503, "The isolated exam environment is temporarily unavailable.", "EXECUTOR_UNAVAILABLE");
     }
+    progress.score = result.score;
+    progress.feedback = result.checks.map(
+      (check, index) =>
+        `${question.subquestions[index]?.label ?? index + 1}: ${check.earned}/${check.maximum} marks`,
+    );
+    recomputeScore(attempt);
+    await saveExamAttempt(db, attempt);
+    return { score: result.score, maximum: result.maximum };
   },
 );
 
@@ -539,7 +577,7 @@ app.post<{ Params: { attemptId: string; questionId: string } }>(
   "/api/attempts/:attemptId/questions/:questionId/activate",
   { preHandler: authenticate },
   async (request) => {
-    const attempt = findAttempt(requireCandidate(request).id, request.params.attemptId);
+    const attempt = await findAttempt(requireCandidate(request).id, request.params.attemptId);
     refreshAttempt(attempt);
     if (attempt.status !== "in_progress") {
       throw new HttpError(409, "This exam attempt is no longer active.", "ATTEMPT_CLOSED");
@@ -561,6 +599,7 @@ app.post<{ Params: { attemptId: string; questionId: string } }>(
       Math.min(attempt.deadlineAt.getTime(), now.getTime() + question.timeLimitSeconds * 1000),
     );
     attempt.currentQuestionId = progress.questionId;
+    await saveExamAttempt(db, attempt);
     return toAttemptDto(attempt);
   },
 );
@@ -569,11 +608,12 @@ app.post<{ Params: { attemptId: string; questionId: string } }>(
   "/api/attempts/:attemptId/questions/:questionId/submit",
   { preHandler: authenticate },
   async (request) => {
-    const attempt = findAttempt(requireCandidate(request).id, request.params.attemptId);
+    const attempt = await findAttempt(requireCandidate(request).id, request.params.attemptId);
     const { progress } = getActiveQuestion(attempt, request.params.questionId);
     progress.status = "submitted";
     progress.submittedAt = new Date();
     recomputeScore(attempt);
+    await saveExamAttempt(db, attempt);
     return toAttemptDto(attempt);
   },
 );
@@ -582,9 +622,10 @@ app.post<{ Params: { attemptId: string } }>(
   "/api/attempts/:attemptId/submit",
   { preHandler: authenticate },
   async (request) => {
-    const attempt = findAttempt(requireCandidate(request).id, request.params.attemptId);
+    const attempt = await findAttempt(requireCandidate(request).id, request.params.attemptId);
     refreshAttempt(attempt);
     if (attempt.status === "in_progress") finalizeAttempt(attempt, "submitted");
+    await saveExamAttempt(db, attempt);
     return toAttemptDto(attempt);
   },
 );
@@ -593,8 +634,9 @@ app.get<{ Params: { attemptId: string } }>(
   "/api/attempts/:attemptId/result",
   { preHandler: authenticate },
   async (request) => {
-    const attempt = findAttempt(requireCandidate(request).id, request.params.attemptId);
+    const attempt = await findAttempt(requireCandidate(request).id, request.params.attemptId);
     refreshAttempt(attempt);
+    await saveExamAttempt(db, attempt);
     if (attempt.status === "in_progress") {
       throw new HttpError(409, "This exam attempt has not been submitted.", "ATTEMPT_ACTIVE");
     }
@@ -607,7 +649,7 @@ app.post<{ Params: { attemptId: string } }>(
   { preHandler: authenticate },
   async (request, reply) => {
     const candidate = requireCandidate(request);
-    const attempt = findAttempt(candidate.id, request.params.attemptId);
+    const attempt = await findAttempt(candidate.id, request.params.attemptId);
     refreshAttempt(attempt);
     if (attempt.status !== "in_progress" || !attempt.currentQuestionId) {
       throw new HttpError(409, "This attempt does not have an active terminal question.", "ATTEMPT_CLOSED");
@@ -617,7 +659,7 @@ app.post<{ Params: { attemptId: string } }>(
       const workspace = await executor.createWorkspace({
         attemptId: attempt.id,
         questionId: progress.questionId,
-        template: getWorkspaceTemplate(attempt.exam.slug),
+        template: getWorkspaceTemplate(attempt.exam.topicSlug),
       });
       getActiveQuestion(attempt, progress.questionId);
       pruneTerminalTickets();
@@ -653,7 +695,7 @@ app.post<{ Params: { attemptId: string } }>(
 app.get<{ Params: { ticket: string } }>(
   "/api/terminal/:ticket",
   { websocket: true, preHandler: authenticate },
-  (socket, request) => {
+  async (socket, request) => {
     const candidate = requireCandidate(request);
     const ticket = terminalTickets.get(request.params.ticket);
     terminalTickets.delete(request.params.ticket);
@@ -663,7 +705,7 @@ app.get<{ Params: { ticket: string } }>(
     }
 
     try {
-      const attempt = findAttempt(candidate.id, ticket.attemptId);
+      const attempt = await findAttempt(candidate.id, ticket.attemptId);
       getActiveQuestion(attempt, ticket.questionId);
     } catch {
       socket.close(1008, "Question is no longer active");
@@ -735,17 +777,24 @@ app.get<{ Params: { ticket: string } }>(
   },
 );
 
+app.addHook("onClose", async () => {
+  await pool.end();
+});
+
 try {
+  await syncExamCatalog(db, examCatalog);
   await app.listen({ host, port });
 } catch (error) {
-  app.log.error({ err: error }, "Could not start the API server");
+  app.log.error(
+    { errorName: error instanceof Error ? error.name : "UnknownError" },
+    "Could not start the API server",
+  );
   process.exitCode = 1;
   await app.close();
 }
 
 const shutdown = async () => {
   await app.close();
-  process.exit(0);
 };
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);

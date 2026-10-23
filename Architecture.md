@@ -18,6 +18,11 @@ The first release supports three topics:
 
 Each exam is worth 40 marks and contains timed questions that may include independently scored subquestions. Both per-question and overall exam timers are enforced by the server.
 
+The Git & GitHub and Docker topics each provide 15 selectable test sets, with
+20 terminal-command questions per set. The Docker sandbox uses a restricted
+in-memory command simulator and does not connect to or launch containers on
+the host Docker daemon.
+
 The system is designed as a **modular monolith for the application API, with a separately isolated execution plane**. This keeps ordinary product logic straightforward to develop while separating untrusted command execution from application services and sensitive data.
 
 ### Core architectural decisions

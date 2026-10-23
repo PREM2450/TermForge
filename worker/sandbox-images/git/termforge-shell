@@ -11,4 +11,7 @@ if [ ! -e /workspace/.git ]; then
 fi
 
 cd /workspace
+if [ "$#" -gt 0 ]; then
+    exec /bin/sh "$@"
+fi
 exec /bin/sh -i

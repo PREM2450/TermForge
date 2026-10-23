@@ -12,6 +12,7 @@ export interface Question {
   prompt: string
   timeLimitSeconds: number
   marks: number
+  difficulty: 'easy' | 'medium' | 'high'
   subquestions: Subquestion[]
 }
 
@@ -31,7 +32,13 @@ export interface Topic {
   slug: TopicSlug
   name: string
   description: string
-  exam?: Pick<Exam, 'id' | 'title' | 'overallDurationSeconds' | 'totalMarks' | 'questions'>
+  tests: Array<{
+    id: string
+    title: string
+    description: string
+    totalMarks: number
+    questionCount: number
+  }>
 }
 
 export interface QuestionProgress extends Question {

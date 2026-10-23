@@ -24,9 +24,15 @@ before awarding marks.
 1.  **Git & GitHub**
 2.  **Docker**
 3.  **Data Migration**
-
 The architecture should make it straightforward to add more topics and
 question sets later.
+
+Git & GitHub and Docker each publish **15 selectable test sets**. Each set
+contains **20 terminal-command questions**, is worth 40 marks, and runs for
+40 minutes. Questions are graded 2 marks each and span easy, medium, and high
+difficulty (5, 9, and 6 questions respectively). Docker exercises use a
+restricted command simulator; they practice Docker CLI workflows without
+creating real images or containers or exposing the host Docker daemon.
 
 ## 2. Product Goals
 

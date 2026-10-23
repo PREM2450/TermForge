@@ -4,6 +4,7 @@ import {
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import { promisify } from "node:util";
+import type { WorkspaceTemplate } from "./workspaces.js";
 
 const execFile = promisify(execFileCallback);
 const dockerCommandTimeoutMs = 5_000;
@@ -34,6 +35,8 @@ export interface DockerRuntime {
   create(input: CreateContainerInput): Promise<string>;
   start(containerId: string): Promise<void>;
   inspectRunning(containerId: string): Promise<boolean>;
+  initializeWorkspace(containerId: string, template: WorkspaceTemplate): Promise<void>;
+  inspectState(containerId: string, template: WorkspaceTemplate): Promise<unknown>;
   openShell(containerId: string): ChildProcessWithoutNullStreams;
   remove(containerId: string): Promise<void>;
 }
@@ -67,6 +70,8 @@ export function buildDockerCreateArgs(input: CreateContainerInput): string[] {
     `/workspace:rw,noexec,nosuid,nodev,size=${input.limits.workspaceMb}m,uid=1000,gid=1000,mode=0700`,
     "--tmpfs",
     "/tmp:rw,noexec,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=0700",
+    "--tmpfs",
+    "/run:rw,noexec,nosuid,nodev,size=8m,uid=0,gid=0,mode=0755",
     "--restart",
     "no",
     "--pull",
@@ -137,6 +142,42 @@ export class DockerCliRuntime implements DockerRuntime {
     if (output.trim() === "true") return true;
     if (output.trim() === "false") return false;
     throw new Error("Docker returned an invalid container state");
+  }
+
+  async initializeWorkspace(containerId: string, template: WorkspaceTemplate): Promise<void> {
+    const id = this.requireContainerId(containerId);
+    if (template === "docker") {
+      await this.run([
+        "exec",
+        "--user",
+        "0:0",
+        id,
+        "/usr/local/bin/termforge-init",
+        "docker-server",
+      ]);
+    }
+    await this.run([
+      "exec",
+      "--user",
+      "1000:1000",
+      id,
+      "/usr/local/bin/termforge-init",
+      template,
+    ]);
+  }
+
+  async inspectState(containerId: string, template: WorkspaceTemplate): Promise<unknown> {
+    const output = await this.run([
+      "exec",
+      this.requireContainerId(containerId),
+      "/usr/local/bin/termforge-inspect",
+      template,
+    ]);
+    const state: unknown = JSON.parse(output);
+    if (state === null || typeof state !== "object" || Array.isArray(state)) {
+      throw new Error("Sandbox inspector returned an invalid state object");
+    }
+    return state;
   }
 
   openShell(containerId: string): ChildProcessWithoutNullStreams {
