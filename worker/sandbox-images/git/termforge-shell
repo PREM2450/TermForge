@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+if [ ! -e /workspace/.git ]; then
+    git init --initial-branch=main /workspace
+    git -C /workspace config user.name "Exam Candidate"
+    git -C /workspace config user.email "candidate@termforge.local"
+    printf '# TermForge exam workspace\n' > /workspace/README.md
+    git -C /workspace add README.md
+    git -C /workspace commit -m "Initial exam workspace"
+fi
+
+cd /workspace
+exec /bin/sh -i
