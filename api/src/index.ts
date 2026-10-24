@@ -22,6 +22,7 @@ import websocket from "@fastify/websocket";
 import argon2 from "argon2";
 import WebSocket, { type RawData } from "ws";
 import { z } from "zod";
+import { getSafeStartupErrorDetails } from "./startup-error.js";
 import { examCatalog, type ExamDefinition, type QuestionDefinition } from "./exams/catalog.js";
 import { assessQuestionState, expectedAnswer } from "./exams/assessment.js";
 import { effectiveDeadline } from "./exams/rules.js";
@@ -87,9 +88,10 @@ declare module "fastify" {
   }
 }
 
-const host = process.env.HOST ?? "127.0.0.1";
-const port = Number(process.env.PORT ?? 3001);
 const isProduction = process.env.NODE_ENV === "production";
+const host = isProduction ? "0.0.0.0" : process.env.HOST ?? "127.0.0.1";
+const rawPort = process.env.PORT;
+const port = Number(rawPort ?? 3001);
 const cookieSecure = process.env.COOKIE_SECURE === "true" || isProduction;
 const jwtSecret =
   process.env.JWT_SECRET ?? "termforge-local-development-secret-change-before-deploy";
@@ -100,8 +102,9 @@ const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
   throw new Error("DATABASE_URL must be configured");
 }
-
-const { db, pool } = createDatabase(databaseUrl);
+if (isProduction && !rawPort) {
+  throw new Error("PORT must be configured in production");
+}
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("PORT must be a valid TCP port");
 }
@@ -112,6 +115,7 @@ if (jwtSecret.length < 32) {
   throw new Error("JWT_SECRET must contain at least 32 characters");
 }
 
+const { db, pool } = createDatabase(databaseUrl);
 const terminalTickets = new Map<string, TerminalTicket>();
 const executor = createExecutor();
 const app = Fastify({
@@ -810,12 +814,14 @@ app.addHook("onClose", async () => {
   await pool.end();
 });
 
+let startupPhase = "exam catalog synchronization";
 try {
   await syncExamCatalog(db, examCatalog);
+  startupPhase = "HTTP server binding";
   await app.listen({ host, port });
 } catch (error) {
   app.log.error(
-    { errorName: error instanceof Error ? error.name : "UnknownError" },
+    { startupPhase, ...getSafeStartupErrorDetails(error) },
     "Could not start the API server",
   );
   process.exitCode = 1;

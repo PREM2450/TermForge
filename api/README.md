@@ -27,7 +27,11 @@ server-side deadlines, and server-side mark calculation.
 
 ## Configuration
 
-- `HOST` / `PORT`: bind address and port (defaults `127.0.0.1:3001`).
+- `HOST` / `PORT`: local defaults are `127.0.0.1:3001`. In production the API
+  binds to `0.0.0.0` and requires the platform-provided `PORT` (Render supplies
+  it automatically); `HOST` only overrides the local-development bind address.
+- `NODE_ENV`: set to `production` on Render to enable production configuration
+  checks and secure cookies.
 - `JWT_SECRET`: signing secret; a local-only development value is used when
   omitted. Set a unique secret of at least 32 characters outside development.
 - `COOKIE_SECURE`: secure-cookie flag. It is enabled automatically in
@@ -41,6 +45,11 @@ server-side deadlines, and server-side mark calculation.
 
 Candidate commands are never executed by this API process. Do not replace the
 isolated worker with a local shell or expose the host Docker socket.
+
+For Render, configure `NODE_ENV=production`, `DATABASE_URL`, and a unique
+`JWT_SECRET` of at least 32 characters. Render supplies `PORT`; no PostgreSQL
+SSL override is set by the API, so use the connection settings required by the
+chosen PostgreSQL provider.
 
 ## Checks
 
