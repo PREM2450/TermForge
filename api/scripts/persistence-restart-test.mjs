@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -12,6 +13,7 @@ const clusterDirectory = await mkdtemp(join(tmpdir(), "termforge-persistence-res
 const postgresLog = join(clusterDirectory, "postgres.log");
 let postgresStarted = false;
 let apiProcess;
+let gradingWorker;
 
 async function unusedPort() {
   const server = createServer();
@@ -69,7 +71,7 @@ async function stopApi() {
   apiProcess = undefined;
 }
 
-async function startApi(port, databaseUrl) {
+async function startApi(port, databaseUrl, workerUrl, workerToken) {
   apiProcess = spawn("node", ["dist/index.js"], {
     cwd: apiDirectory,
     env: {
@@ -79,6 +81,8 @@ async function startApi(port, databaseUrl) {
       PORT: String(port),
       NODE_ENV: "test",
       JWT_SECRET: randomUUID() + randomUUID(),
+      SANDBOX_WORKER_URL: workerUrl,
+      SANDBOX_WORKER_TOKEN: workerToken,
     },
     stdio: "ignore",
   });
@@ -110,6 +114,48 @@ async function startApi(port, databaseUrl) {
     }
   }
   throw new Error("Test API did not become healthy against the isolated database");
+}
+
+async function startGradingWorker() {
+  const workerToken = randomUUID() + randomUUID();
+  gradingWorker = createHttpServer((request, response) => {
+    const match = request.url?.match(
+      /^\/v1\/attempts\/[0-9a-f-]+\/questions\/(git-github-test-01-q[0-9]+)\/state$/,
+    );
+    if (
+      request.method !== "POST" ||
+      request.headers.authorization !== `Bearer ${workerToken}` ||
+      !match
+    ) {
+      response.writeHead(404).end();
+      return;
+    }
+    const state = match[1] === "git-github-test-01-q1"
+      ? { git: { branch: "main" } }
+      : match[1] === "git-github-test-01-q2"
+        ? { git: { config: { userName: "Candidate 1" } } }
+        : {};
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ state }));
+  });
+  gradingWorker.listen(0, "127.0.0.1");
+  await once(gradingWorker, "listening");
+  const address = gradingWorker.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Could not allocate a local test grading worker port");
+  }
+  return {
+    token: workerToken,
+    url: `http://127.0.0.1:${address.port}`,
+  };
+}
+
+async function stopGradingWorker() {
+  if (!gradingWorker?.listening) return;
+  await new Promise((resolve, reject) =>
+    gradingWorker.close((error) => (error ? reject(error) : resolve())),
+  );
+  gradingWorker = undefined;
 }
 
 async function requestJson(port, path, { method = "GET", body, cookie } = {}) {
@@ -148,6 +194,7 @@ try {
   const apiPort = await unusedPort();
   const databaseName = `termforge_restart_${process.pid}`;
   const databaseUrl = `postgres://${encodeURIComponent(username)}@127.0.0.1:${postgresPort}/${databaseName}`;
+  const gradingWorkerInfo = await startGradingWorker();
 
   await command("initdb", [
     "--auth=trust",
@@ -178,7 +225,7 @@ try {
     env: { ...process.env, DATABASE_URL: databaseUrl },
   });
 
-  await startApi(apiPort, databaseUrl);
+  await startApi(apiPort, databaseUrl, gradingWorkerInfo.url, gradingWorkerInfo.token);
   const email = `restart-${randomUUID()}@termforge.test`;
   const password = `Restart-test-${randomUUID()}`;
   const registration = await requestJson(apiPort, "/api/auth/register", {
@@ -190,22 +237,38 @@ try {
   }
   const firstCookie = sessionCookie(registration.response);
 
-  const createdAttempt = await requestJson(apiPort, "/api/exams/data-migration/attempts", {
+  const createdAttempt = await requestJson(apiPort, "/api/exams/git-github-test-01/attempts", {
     method: "POST",
     cookie: firstCookie,
   });
   const attemptId = createdAttempt.data?.id;
-  if (typeof attemptId !== "string" || createdAttempt.data.questions?.length !== 5) {
-    throw new Error("API did not create the expected data migration attempt");
+  if (typeof attemptId !== "string" || createdAttempt.data.questions?.length !== 20) {
+    throw new Error("API did not create the expected Git and GitHub attempt");
+  }
+  if (
+    createdAttempt.data.totalScore !== null ||
+    createdAttempt.data.questions[0].score !== null ||
+    createdAttempt.data.questions[0].expectedAnswers !== undefined
+  ) {
+    throw new Error("Active attempts exposed scores or answer keys before final submission");
   }
 
   const firstQuestionId = createdAttempt.data.questions[0].id;
   const secondQuestionId = createdAttempt.data.questions[1].id;
-  await requestJson(
+  const thirdQuestionId = createdAttempt.data.questions[2].id;
+  const submitted = await requestJson(
     apiPort,
     `/api/attempts/${encodeURIComponent(attemptId)}/questions/${encodeURIComponent(firstQuestionId)}/submit`,
     { method: "POST", cookie: firstCookie },
   );
+  if (
+    submitted.data.questions?.[0]?.score !== null ||
+    submitted.data.totalScore !== null ||
+    submitted.data.questions?.[0]?.expectedAnswers !== undefined ||
+    submitted.data.questions?.[0]?.status !== "submitted"
+  ) {
+    throw new Error("Active attempt exposed a question score or answer key before final submission");
+  }
   const progress = await requestJson(
     apiPort,
     `/api/attempts/${encodeURIComponent(attemptId)}/questions/${encodeURIComponent(secondQuestionId)}/activate`,
@@ -213,13 +276,43 @@ try {
   );
   if (
     progress.data.questions[0].status !== "submitted" ||
+    progress.data.questions[0].score !== null ||
+    progress.data.totalScore !== null ||
+    progress.data.questions[0].feedback !== undefined ||
     progress.data.questions[1].status !== "active"
   ) {
     throw new Error("API did not save the expected pre-restart question progress");
   }
+  const secondSubmitted = await requestJson(
+    apiPort,
+    `/api/attempts/${encodeURIComponent(attemptId)}/questions/${encodeURIComponent(secondQuestionId)}/submit`,
+    { method: "POST", cookie: firstCookie },
+  );
+  if (
+    secondSubmitted.data.questions?.[1]?.score !== null ||
+    secondSubmitted.data.totalScore !== null ||
+    secondSubmitted.data.questions?.[1]?.feedback !== undefined ||
+    secondSubmitted.data.questions?.[1]?.status !== "submitted"
+  ) {
+    throw new Error("Active attempt exposed its question score or grading log before final submission");
+  }
+  const nextProgress = await requestJson(
+    apiPort,
+    `/api/attempts/${encodeURIComponent(attemptId)}/questions/${encodeURIComponent(thirdQuestionId)}/activate`,
+    { method: "POST", cookie: firstCookie },
+  );
+  if (
+    nextProgress.data.questions?.[0]?.score !== null ||
+    nextProgress.data.questions?.[1]?.score !== null ||
+    nextProgress.data.totalScore !== null ||
+    nextProgress.data.questions?.[0]?.expectedAnswers !== undefined ||
+    nextProgress.data.questions?.[2]?.status !== "active"
+  ) {
+    throw new Error("Cumulative score or next-question progress was not saved");
+  }
 
   await stopApi();
-  await startApi(apiPort, databaseUrl);
+  await startApi(apiPort, databaseUrl, gradingWorkerInfo.url, gradingWorkerInfo.token);
 
   const login = await requestJson(apiPort, "/api/auth/login", {
     method: "POST",
@@ -237,14 +330,39 @@ try {
   if (
     restored.data?.id !== attemptId ||
     restored.data.questions?.[0]?.status !== "submitted" ||
-    restored.data.questions?.[1]?.status !== "active"
+    restored.data.questions?.[0]?.score !== null ||
+    restored.data.questions?.[1]?.status !== "submitted" ||
+    restored.data.questions?.[1]?.score !== null ||
+    restored.data.totalScore !== null ||
+    restored.data.questions?.[0]?.feedback !== undefined ||
+    restored.data.questions?.[0]?.expectedAnswers !== undefined ||
+    restored.data.questions?.[2]?.status !== "active"
   ) {
     throw new Error("Attempt or saved question progress was not restored after API restart");
   }
 
-  console.log("PASS: API registration, attempt progress, restart, login, and progress restoration.");
+  const finalResults = await requestJson(
+    apiPort,
+    `/api/attempts/${encodeURIComponent(attemptId)}/submit`,
+    { method: "POST", cookie: restartedCookie },
+  );
+  if (
+    finalResults.data?.status !== "submitted" ||
+    finalResults.data.totalScore !== 4 ||
+    finalResults.data.questions?.[0]?.score !== 2 ||
+    finalResults.data.questions?.[1]?.score !== 2 ||
+    finalResults.data.questions?.[2]?.score !== 0 ||
+    finalResults.data.questions?.[0]?.expectedAnswers?.[0]?.requirement !== 'git.branch = "main"' ||
+    !finalResults.data.questions?.[0]?.feedback?.[0]?.includes('observed "main"') ||
+    !finalResults.data.questions?.[2]?.feedback?.[0]?.includes("Incorrect")
+  ) {
+    throw new Error("Final results did not reveal correct scores, expected answers, and grading logs");
+  }
+
+  console.log("PASS: hidden in-progress scores, final question review, cumulative grading, and restart persistence.");
 } finally {
   await stopApi().catch(() => {});
+  await stopGradingWorker().catch(() => {});
   if (postgresStarted) {
     try {
       await command(

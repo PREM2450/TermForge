@@ -45,8 +45,13 @@ export interface QuestionProgress extends Question {
   status: 'locked' | 'active' | 'submitted' | 'expired' | 'skipped'
   startedAt: string | null
   deadlineAt: string | null
-  score: number
+  score: number | null
   feedback?: string[]
+  expectedAnswers?: Array<{
+    label: string
+    prompt: string
+    requirement: string
+  }>
 }
 
 export interface Attempt {
@@ -56,7 +61,7 @@ export interface Attempt {
   startedAt: string
   examDeadlineAt: string
   currentQuestionId: string | null
-  totalScore: number
+  totalScore: number | null
   questions: QuestionProgress[]
 }
 

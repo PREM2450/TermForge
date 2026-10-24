@@ -64,7 +64,7 @@ export const api = {
     request<Attempt>(`/api/exams/${examId}/attempts`, { method: 'POST' }),
   getAttempt: (id: string) => request<Attempt>(`/api/attempts/${id}`),
   checkQuestion: (attemptId: string, questionId: string) =>
-    request<{ score: number; maximum: number; feedback?: string[] }>(
+    request<{ checked: boolean }>(
       `/api/attempts/${attemptId}/questions/${questionId}/check`,
       { method: 'POST' },
     ),

@@ -250,7 +250,7 @@ function App() {
     try {
       await api.checkQuestion(attempt.id, question.id)
       updateAttempt(await api.getAttempt(attempt.id))
-      setNotice('Answer checked. Your score is recorded by the exam service.')
+      setNotice('Check saved. Your marks and answer review will be shown after you submit the exam.')
     } catch (checkError) {
       setError(displayError(checkError))
     } finally {
@@ -773,6 +773,7 @@ function ExamScreen({
   const questionRemaining = secondsRemaining(question?.deadlineAt, now)
   const examRemaining = secondsRemaining(attempt.examDeadlineAt, now)
   const completedCount = attempt.questions.filter((item) => item.status === 'submitted' || item.status === 'expired').length
+  const resultsReady = attempt.status !== 'in_progress'
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
@@ -845,7 +846,6 @@ function ExamScreen({
             <div className="question-card-meta">
               <span className="eyebrow">PRACTICAL TASK</span>
               <span className={`difficulty-pill difficulty-${question.difficulty}`}>{question.difficulty} difficulty</span>
-              <span className="marks-pill">{question.marks} marks</span>
             </div>
             <h1>{question.title}</h1>
             <p className="question-prompt">{question.prompt}</p>
@@ -854,7 +854,6 @@ function ExamScreen({
                 <article className="subquestion" key={subquestion.id}>
                   <span className="subquestion-letter">{String.fromCharCode(65 + index)}</span>
                   <p>{subquestion.prompt}</p>
-                  <span className="subquestion-marks">{subquestion.marks} pts</span>
                 </article>
               ))}
             </div>
@@ -894,17 +893,17 @@ function ExamScreen({
         </div>
         <aside className="exam-sidebar">
           <div className="sidebar-card">
-            <div className="sidebar-heading"><h2>Questions</h2><span>{attempt.totalScore}/{attempt.questions.reduce((sum, item) => sum + item.marks, 0)} pts</span></div>
+            <div className="sidebar-heading"><h2>Questions</h2><span>{resultsReady ? `${attempt.totalScore ?? 0}/${attempt.questions.reduce((sum, item) => sum + item.marks, 0)} pts` : `${completedCount} completed`}</span></div>
             <div className="sidebar-question-list">
               {attempt.questions.map((item, index) => (
                 <div className={`sidebar-question ${item.id === question.id ? 'current' : ''}`} key={item.id}>
                   <span className="sidebar-q-number">{String(index + 1).padStart(2, '0')}</span>
                   <span className="sidebar-q-name">{item.title}</span>
-                  {item.status === 'submitted' ? <span className="status-check" aria-label="Submitted">✓</span> : item.id === question.id ? <span className="status-current" aria-label="Current" /> : <span className="sidebar-q-mark">{item.marks}</span>}
+                  {item.status === 'submitted' && resultsReady ? <span className="sidebar-q-score" aria-label={`Score ${item.score ?? 0} of ${item.marks} marks`}>{item.score ?? 0}/{item.marks}</span> : item.status === 'submitted' ? <span className="status-check" aria-label="Submitted">✓</span> : item.id === question.id ? <span className="status-current" aria-label="Current" /> : <span />}
                 </div>
               ))}
             </div>
-            <div className="sidebar-total"><span>Exam total</span><strong>40 <small>marks</small></strong></div>
+            <div className="sidebar-total"><span>{resultsReady ? 'Exam total' : 'Score report'}</span><strong>{resultsReady ? <>40 <small>marks</small></> : 'After submit'}</strong></div>
           </div>
           <div className="sidebar-note"><span aria-hidden="true">◷</span><p><strong>Timers keep running</strong>Your exam and question clocks continue even when you leave this page.</p></div>
         </aside>
@@ -954,6 +953,40 @@ function TerminalPanel({ attemptId, question }: { attemptId: string; question: Q
     let terminal: TerminalInstance | undefined
     let fitAddon: FitAddonInstance | undefined
     let resizeObserver: ResizeObserver | undefined
+    let terminalReady = false
+    let pendingInput: string[] = []
+    let pendingInputBytes = 0
+    let currentInput = ''
+
+    const sendTerminalInput = (data: string) => {
+      if (socket?.readyState !== WebSocket.OPEN) {
+        setConnectionMessage('The terminal connection closed before input could be sent.')
+        return
+      }
+      for (const character of data) {
+        if (character === '\r') {
+          terminal?.write('\r\n')
+          socket.send(`${currentInput}\n`)
+          currentInput = ''
+        } else if (character === '\u007f') {
+          if (currentInput.length > 0) {
+            currentInput = currentInput.slice(0, -1)
+            terminal?.write('\b \b')
+          }
+        } else if (character === '\u0003') {
+          if (currentInput.length > 0) {
+            currentInput = ''
+            terminal?.write('^C\r\n')
+          }
+        } else if (character === '\t') {
+          currentInput += '    '
+          terminal?.write('    ')
+        } else if (character >= ' ') {
+          currentInput += character
+          terminal?.write(character)
+        }
+      }
+    }
 
     const setup = async () => {
       setConnection('connecting')
@@ -984,14 +1017,22 @@ function TerminalPanel({ attemptId, question }: { attemptId: string; question: Q
         terminal.loadAddon(fitAddon)
         terminal.open(host)
         fitAddon.fit()
-        terminal.writeln('\x1b[38;2;114;224;194mConnected to your isolated workspace\x1b[0m')
+        terminal.writeln('\x1b[38;2;180;188;200mStarting your isolated workspace…\x1b[0m')
         socket = new WebSocket(endpoint)
         socket.binaryType = 'arraybuffer'
         socket.addEventListener('open', () => {
-          if (disposed) return
-          setConnection('connected')
+          if (!disposed) setConnection('connecting')
         })
         socket.addEventListener('message', (event) => {
+          if (event.data === 'termforge:terminal-ready') {
+            terminalReady = true
+            setConnection('connected')
+            terminal?.writeln('\x1b[38;2;114;224;194mConnected to your isolated workspace\x1b[0m')
+            for (const input of pendingInput) sendTerminalInput(input)
+            pendingInput = []
+            pendingInputBytes = 0
+            return
+          }
           if (event.data instanceof ArrayBuffer) {
             terminal?.write(new Uint8Array(event.data))
           } else if (typeof event.data === 'string') {
@@ -1009,32 +1050,17 @@ function TerminalPanel({ attemptId, question }: { attemptId: string; question: Q
             setConnectionMessage('Could not connect to the isolated terminal worker.')
           }
         })
-        let currentInput = ''
         terminal.onData((data) => {
-          if (socket?.readyState !== WebSocket.OPEN) return
-          for (const character of data) {
-            if (character === '\r') {
-              terminal?.write('\r\n')
-              socket.send(`${currentInput}\n`)
-              currentInput = ''
-            } else if (character === '\u007f') {
-              if (currentInput.length > 0) {
-                currentInput = currentInput.slice(0, -1)
-                terminal?.write('\b \b')
-              }
-            } else if (character === '\u0003') {
-              if (currentInput.length > 0) {
-                currentInput = ''
-                terminal?.write('^C\r\n')
-              }
-            } else if (character === '\t') {
-              currentInput += '    '
-              terminal?.write('    ')
-            } else if (character >= ' ') {
-              currentInput += character
-              terminal?.write(character)
+          if (!terminalReady) {
+            if (pendingInputBytes + data.length > 16 * 1024) {
+              setConnectionMessage('The terminal is still starting. Wait for it to connect before typing more.')
+              return
             }
+            pendingInput.push(data)
+            pendingInputBytes += data.length
+            return
           }
+          sendTerminalInput(data)
         })
         resizeObserver = new ResizeObserver(() => {
           try {
@@ -1122,7 +1148,8 @@ function ConfirmDialog({
 
 function ResultsScreen({ attempt, onDashboard }: { attempt: Attempt; onDashboard: () => void }) {
   const maximum = attempt.questions.reduce((sum, question) => sum + question.marks, 0)
-  const percentage = maximum === 0 ? 0 : Math.round((attempt.totalScore / maximum) * 100)
+  const totalScore = attempt.totalScore ?? 0
+  const percentage = maximum === 0 ? 0 : Math.round((totalScore / maximum) * 100)
   const completed = attempt.questions.filter((question) => question.status === 'submitted').length
   const unanswered = attempt.questions.filter((question) => question.status === 'skipped' || question.status === 'locked').length
 
@@ -1133,7 +1160,7 @@ function ResultsScreen({ attempt, onDashboard }: { attempt: Attempt; onDashboard
         <h1>You showed up.<br /><em>That counts.</em></h1>
         <p>Your results are ready. Review your score and question breakdown below.</p>
         <div className="result-score">
-          <strong>{attempt.totalScore}</strong><span>/ {maximum}</span>
+          <strong>{totalScore}</strong><span>/ {maximum}</span>
           <small>marks earned · {percentage}%</small>
         </div>
       </div>
@@ -1149,13 +1176,32 @@ function ResultsScreen({ attempt, onDashboard }: { attempt: Attempt; onDashboard
             <span className="result-index">{String(index + 1).padStart(2, '0')}</span>
             <div className="result-question-main">
               <strong>{question.title}</strong>
+              <span className={`result-outcome ${question.status === 'skipped' || question.status === 'locked' ? 'result-outcome-unattempted' : question.score === question.marks ? 'result-outcome-correct' : question.score === 0 ? 'result-outcome-incorrect' : 'result-outcome-partial'}`}>
+                {question.status === 'skipped' || question.status === 'locked'
+                  ? 'Not attempted'
+                  : question.score === question.marks
+                    ? 'Correct'
+                    : question.score === 0
+                      ? 'Incorrect'
+                      : 'Partially correct'}
+              </span>
               {question.feedback?.length ? (
                 <ul>{question.feedback.map((item, feedbackIndex) => <li key={`${question.id}-${feedbackIndex}`}>{item}</li>)}</ul>
               ) : (
-                <span>{question.status === 'expired' ? 'Time expired' : question.status === 'skipped' || question.status === 'locked' ? 'Not attempted' : 'Submitted'}</span>
+                <span>{question.status === 'expired' ? 'Time expired' : 'No grading log available'}</span>
               )}
+              {question.expectedAnswers?.length ? (
+                <div className="result-expected">
+                  <strong>Expected result</strong>
+                  {question.expectedAnswers.map((answer) => (
+                    <p key={`${question.id}-${answer.label}`}>
+                      <b>{answer.label}.</b> {answer.prompt} <code>{answer.requirement}</code>
+                    </p>
+                  ))}
+                </div>
+              ) : null}
             </div>
-            <strong className="result-marks">{question.score}<small> / {question.marks}</small></strong>
+            <strong className="result-marks">{question.score ?? 0}<small> / {question.marks}</small></strong>
           </article>
         ))}
       </div>

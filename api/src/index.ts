@@ -23,7 +23,8 @@ import argon2 from "argon2";
 import WebSocket, { type RawData } from "ws";
 import { z } from "zod";
 import { examCatalog, type ExamDefinition, type QuestionDefinition } from "./exams/catalog.js";
-import { effectiveDeadline, gradeQuestion } from "./exams/rules.js";
+import { assessQuestionState, expectedAnswer } from "./exams/assessment.js";
+import { effectiveDeadline } from "./exams/rules.js";
 import {
   createExecutor,
   ExecutorUnavailableError,
@@ -93,6 +94,7 @@ const cookieSecure = process.env.COOKIE_SECURE === "true" || isProduction;
 const jwtSecret =
   process.env.JWT_SECRET ?? "termforge-local-development-secret-change-before-deploy";
 const cookieName = "termforge_session";
+const terminalReadyMessage = "termforge:terminal-ready";
 const databaseUrl = process.env.DATABASE_URL;
 
 if (!databaseUrl) {
@@ -215,12 +217,38 @@ function recomputeScore(attempt: ExamAttempt): void {
   attempt.totalScore = attempt.questions.reduce((sum, item) => sum + item.score, 0);
 }
 
+async function assessActiveQuestion(
+  attempt: ExamAttempt,
+  question: QuestionDefinition,
+  progress: QuestionAttempt,
+  request: FastifyRequest,
+): Promise<ReturnType<typeof assessQuestionState>> {
+  let result: ReturnType<typeof assessQuestionState>;
+  try {
+    const state = await executor.inspect({
+      attemptId: attempt.id,
+      questionId: progress.questionId,
+    });
+    result = assessQuestionState(state, question);
+  } catch (error) {
+    if (error instanceof ExecutorUnavailableError) {
+      throw new HttpError(503, "Isolated terminal execution is not configured.", error.code);
+    }
+    request.log.error("Could not inspect isolated exam environment");
+    throw new HttpError(503, "The isolated exam environment is temporarily unavailable.", "EXECUTOR_UNAVAILABLE");
+  }
+  progress.score = result.score;
+  progress.feedback = result.feedback;
+  recomputeScore(attempt);
+  return result;
+}
+
 function finalizeAttempt(attempt: ExamAttempt, status: "submitted" | "expired"): void {
   if (attempt.status !== "in_progress") return;
   const now = new Date();
   for (const question of attempt.questions) {
     if (question.status === "active") {
-      question.status = status === "expired" ? "expired" : "skipped";
+      question.status = status === "expired" ? "expired" : "submitted";
       question.submittedAt = now;
     } else if (question.status === "locked") {
       question.status = "skipped";
@@ -251,6 +279,7 @@ function refreshAttempt(attempt: ExamAttempt): void {
 }
 
 function toAttemptDto(attempt: ExamAttempt) {
+  const resultsReady = attempt.status !== "in_progress";
   return {
     id: attempt.id,
     examId: attempt.exam.slug,
@@ -258,7 +287,7 @@ function toAttemptDto(attempt: ExamAttempt) {
     startedAt: attempt.startedAt.toISOString(),
     examDeadlineAt: attempt.deadlineAt.toISOString(),
     currentQuestionId: attempt.currentQuestionId,
-    totalScore: attempt.totalScore,
+    totalScore: resultsReady ? attempt.totalScore : null,
     questions: attempt.exam.questions.map((question, index) => {
       const progress = attempt.questions[index];
       if (!progress) throw new Error("Attempt question state is missing");
@@ -273,8 +302,9 @@ function toAttemptDto(attempt: ExamAttempt) {
         status: QuestionStatus;
         startedAt: string | null;
         deadlineAt: string | null;
-        score: number;
+        score: number | null;
         feedback?: string[];
+        expectedAnswers?: Array<{ label: string; prompt: string; requirement: string }>;
       } = {
         id: progress.questionId,
         title: question.title,
@@ -290,9 +320,16 @@ function toAttemptDto(attempt: ExamAttempt) {
         status: progress.status,
         startedAt: progress.startedAt?.toISOString() ?? null,
         deadlineAt: progress.deadlineAt?.toISOString() ?? null,
-        score: progress.score,
+        score: resultsReady ? progress.score : null,
       };
-      if (attempt.exam.slug && progress.feedback) dto.feedback = progress.feedback;
+      if (resultsReady) {
+        if (progress.feedback) dto.feedback = progress.feedback;
+        dto.expectedAnswers = question.subquestions.map((subquestion) => ({
+          label: subquestion.label,
+          prompt: subquestion.prompt,
+          requirement: expectedAnswer(subquestion),
+        }));
+      }
       return dto;
     }),
   };
@@ -548,28 +585,9 @@ app.post<{ Params: { attemptId: string; questionId: string } }>(
   async (request) => {
     const attempt = await findAttempt(requireCandidate(request).id, request.params.attemptId);
     const { question, progress } = getActiveQuestion(attempt, request.params.questionId);
-    let result: ReturnType<typeof gradeQuestion>;
-    try {
-      const state = await executor.inspect({
-        attemptId: attempt.id,
-        questionId: progress.questionId,
-      });
-      result = gradeQuestion(state, question);
-    } catch (error) {
-      if (error instanceof ExecutorUnavailableError) {
-        throw new HttpError(503, "Isolated terminal execution is not configured.", error.code);
-      }
-      request.log.error("Could not inspect isolated exam environment");
-      throw new HttpError(503, "The isolated exam environment is temporarily unavailable.", "EXECUTOR_UNAVAILABLE");
-    }
-    progress.score = result.score;
-    progress.feedback = result.checks.map(
-      (check, index) =>
-        `${question.subquestions[index]?.label ?? index + 1}: ${check.earned}/${check.maximum} marks`,
-    );
-    recomputeScore(attempt);
+    await assessActiveQuestion(attempt, question, progress, request);
     await saveExamAttempt(db, attempt);
-    return { score: result.score, maximum: result.maximum };
+    return { checked: true };
   },
 );
 
@@ -609,7 +627,10 @@ app.post<{ Params: { attemptId: string; questionId: string } }>(
   { preHandler: authenticate },
   async (request) => {
     const attempt = await findAttempt(requireCandidate(request).id, request.params.attemptId);
-    const { progress } = getActiveQuestion(attempt, request.params.questionId);
+    const { question, progress } = getActiveQuestion(attempt, request.params.questionId);
+    if (attempt.exam.topicSlug !== "data-migration") {
+      await assessActiveQuestion(attempt, question, progress, request);
+    }
     progress.status = "submitted";
     progress.submittedAt = new Date();
     recomputeScore(attempt);
@@ -624,7 +645,14 @@ app.post<{ Params: { attemptId: string } }>(
   async (request) => {
     const attempt = await findAttempt(requireCandidate(request).id, request.params.attemptId);
     refreshAttempt(attempt);
-    if (attempt.status === "in_progress") finalizeAttempt(attempt, "submitted");
+    if (attempt.status === "in_progress") {
+      const active = attempt.questions.find((progress) => progress.status === "active");
+      if (active && attempt.exam.topicSlug !== "data-migration") {
+        const { question } = findQuestion(attempt, active.questionId);
+        await assessActiveQuestion(attempt, question, active, request);
+      }
+      finalizeAttempt(attempt, "submitted");
+    }
     await saveExamAttempt(db, attempt);
     return toAttemptDto(attempt);
   },
@@ -734,6 +762,7 @@ app.get<{ Params: { ticket: string } }>(
         upstream.close();
         return;
       }
+      socket.send(terminalReadyMessage);
       for (const message of pendingInput.splice(0)) {
         upstream.send(message.data, { binary: message.binary });
       }
