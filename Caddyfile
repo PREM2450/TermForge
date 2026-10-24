@@ -1,0 +1,17 @@
+http://127.0.0.1:8080, http://macbook-air.tailf2aea7.ts.net:8080 {
+    bind 127.0.0.1
+
+    handle /api/* {
+        reverse_proxy 127.0.0.1:3001
+    }
+
+    handle /health {
+        reverse_proxy 127.0.0.1:3001
+    }
+
+    handle {
+        root * /Users/premkumar/Desktop/TermForge/web/dist
+        try_files {path} /index.html
+        file_server
+    }
+}
