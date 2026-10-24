@@ -1,59 +1,58 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { getSafeStartupErrorDetails } from "./startup-error.js";
 
-afterEach(() => {
-  vi.unstubAllEnvs();
-});
-
 describe("startup error details", () => {
-  it("redacts configured credentials, URLs, and sensitive assignments", () => {
-    vi.stubEnv("JWT_SECRET", "jwt-secret-value");
-    vi.stubEnv("SANDBOX_WORKER_TOKEN", "worker-token-value");
-
-    const details = getSafeStartupErrorDetails(
-      new Error(
-        "failed at postgresql://db-user:db-password@db.example/termforge " +
-          "JWT_SECRET=jwt-secret-value worker_token: worker-token-value password='another-secret'",
-      ),
+  it("includes safe PostgreSQL diagnostic metadata from a wrapped database error", () => {
+    const databaseError = Object.assign(
+      new Error("duplicate key includes fake-sensitive-value"),
+      {
+        code: "23505",
+        constraint: "topics_slug_uq",
+        schema: "public",
+        table: "topics",
+      },
+    );
+    const queryError = new Error(
+      "failed query with postgresql://user:fake-password@db.example " +
+        'parameters ["fake-token-value"]',
+      { cause: databaseError },
     );
 
-    expect(details.errorMessage).not.toContain("db-password");
-    expect(details.errorMessage).not.toContain("jwt-secret-value");
-    expect(details.errorMessage).not.toContain("worker-token-value");
-    expect(details.errorMessage).not.toContain("another-secret");
-    expect(details.errorMessage).not.toContain("postgresql://");
-    expect(details.errorName).toBe("Error");
+    const details = getSafeStartupErrorDetails(queryError);
+    const serialized = JSON.stringify(details);
+
+    expect(details).toMatchObject({
+      errorName: "Error",
+      errorCode: "23505",
+      constraintName: "topics_slug_uq",
+      schemaName: "public",
+      tableName: "topics",
+    });
+    expect(serialized).not.toContain("fake-sensitive-value");
+    expect(serialized).not.toContain("fake-password");
+    expect(serialized).not.toContain("fake-token-value");
+    expect(serialized).not.toContain("postgresql://");
+    expect(serialized).not.toContain("parameters");
   });
 
-  it("redacts quoted JSON credential fields", () => {
-    const secretValues = [
-      "json-password-value",
-      "json-token-value",
-      "json-secret-value",
-      "json-api-key-value",
-      "json-private-key-value",
-    ];
-    const details = getSafeStartupErrorDetails(
-      new Error(
-        JSON.stringify({
-          password: secretValues[0],
-          token: secretValues[1],
-          secret: secretValues[2],
-          api_key: secretValues[3],
-          privateKey: secretValues[4],
-        }),
-      ),
-    );
-
-    for (const secret of secretValues) {
-      expect(details.errorMessage).not.toContain(secret);
-    }
-  });
-
-  it.each(["23505", "28P01"])("preserves PostgreSQL SQLSTATE %s", (code) => {
+  it.each(["23505", "28P01", "42P10"])("accepts PostgreSQL SQLSTATE %s", (code) => {
     const error = Object.assign(new Error("database error"), { code });
 
     expect(getSafeStartupErrorDetails(error).errorCode).toBe(code);
+  });
+
+  it("omits malformed diagnostic metadata", () => {
+    const error = Object.assign(new Error("database error"), {
+      code: "not-a-code",
+      constraint: "constraint with parameters",
+      schema: "public; DROP TABLE users",
+      table: "topics",
+    });
+
+    expect(getSafeStartupErrorDetails(error)).toEqual({
+      errorName: "Error",
+      tableName: "topics",
+    });
   });
 
   it("does not stringify unknown errors or include an error stack", () => {

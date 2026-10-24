@@ -1,38 +1,57 @@
-const connectionStringPattern = /\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi;
-const sensitiveAssignmentPattern =
-  /((?:["']?[\w.-]*(?:password|passwd|pwd|secret|token|authorization|api[_-]?key|private[_-]?key)[\w.-]*["']?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)/gi;
+const postgresCodePattern = /^[0-9A-Z]{5}$/;
+const postgresIdentifierPattern = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/;
+
+function readStringProperty(value: object, key: string): string | undefined {
+  const property = Object.getOwnPropertyDescriptor(value, key);
+  return property && "value" in property && typeof property.value === "string"
+    ? property.value
+    : undefined;
+}
 
 export function getSafeStartupErrorDetails(error: unknown): {
   errorName: string;
   errorCode?: string;
-  errorMessage?: string;
+  constraintName?: string;
+  schemaName?: string;
+  tableName?: string;
 } {
   if (!(error instanceof Error)) {
     return { errorName: "UnknownError" };
   }
 
-  let errorMessage = error.message;
-  for (const [name, value] of Object.entries(process.env)) {
-    if (value && /(?:PASSWORD|SECRET|TOKEN|DATABASE_URL)/i.test(name)) {
-      errorMessage = errorMessage.replaceAll(value, "[REDACTED]");
-    }
-  }
-  errorMessage = errorMessage
-    .replace(connectionStringPattern, "[REDACTED_URL]")
-    .replace(sensitiveAssignmentPattern, '$1"[REDACTED]"');
+  let errorCode: string | undefined;
+  let constraintName: string | undefined;
+  let schemaName: string | undefined;
+  let tableName: string | undefined;
+  let current: unknown = error;
+  const visited = new Set<object>();
 
-  const errorCode =
-    "code" in error &&
-    typeof error.code === "string" &&
-    /^[A-Z0-9]{5}$/.test(error.code)
-      ? error.code
-      : undefined;
+  for (let depth = 0; depth < 8 && current !== null && typeof current === "object"; depth++) {
+    if (visited.has(current)) break;
+    visited.add(current);
+
+    const code = readStringProperty(current, "code");
+    if (!errorCode && code && postgresCodePattern.test(code)) errorCode = code;
+
+    const constraint = readStringProperty(current, "constraint");
+    if (!constraintName && constraint && postgresIdentifierPattern.test(constraint)) {
+      constraintName = constraint;
+    }
+
+    const schema = readStringProperty(current, "schema");
+    if (!schemaName && schema && postgresIdentifierPattern.test(schema)) schemaName = schema;
+
+    const table = readStringProperty(current, "table");
+    if (!tableName && table && postgresIdentifierPattern.test(table)) tableName = table;
+
+    current = Object.getOwnPropertyDescriptor(current, "cause")?.value;
+  }
 
   return {
-    errorName: /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(error.name)
-      ? error.name
-      : "Error",
+    errorName: /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(error.name) ? error.name : "Error",
     ...(errorCode ? { errorCode } : {}),
-    errorMessage,
+    ...(constraintName ? { constraintName } : {}),
+    ...(schemaName ? { schemaName } : {}),
+    ...(tableName ? { tableName } : {}),
   };
 }
