@@ -180,6 +180,7 @@ describe("PostgreSQL persistence", () => {
     const exam = examCatalog.find((item) => item.topicSlug === "data-migration");
     expect(exam).toBeDefined();
     await syncExamCatalog(db, [exam!]);
+    await syncExamCatalog(db, [exam!]);
     const user = await insertUser(db, {
       name: "Attempt Candidate",
       email: "attempt@example.test",
