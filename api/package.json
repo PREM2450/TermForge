@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.3.1",
     "@fastify/jwt": "^10.2.5",
     "@fastify/websocket": "^11.3.4",
     "argon2": "^0.41.1",

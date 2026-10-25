@@ -17,11 +17,13 @@ import {
 } from "./db/persistence.js";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
+import cors from "@fastify/cors";
 import jwt from "@fastify/jwt";
 import websocket from "@fastify/websocket";
 import argon2 from "argon2";
 import WebSocket, { type RawData } from "ws";
 import { z } from "zod";
+import { corsOptions } from "./cors.js";
 import { getSafeStartupErrorDetails } from "./startup-error.js";
 import { examCatalog, type ExamDefinition, type QuestionDefinition } from "./exams/catalog.js";
 import { assessQuestionState, expectedAnswer } from "./exams/assessment.js";
@@ -125,6 +127,7 @@ const app = Fastify({
 });
 
 app.decorateRequest("candidate", null);
+await app.register(cors, corsOptions);
 await app.register(cookie);
 await app.register(websocket);
 await app.register(jwt, {
