@@ -453,7 +453,7 @@ function applySessionCookie(reply: FastifyReply, token: string): void {
     path: "/",
     httpOnly: true,
     secure: cookieSecure,
-    sameSite: "lax",
+    sameSite: "none",
     maxAge: 60 * 60 * 12,
   });
 }
